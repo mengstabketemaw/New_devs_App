@@ -1,21 +1,58 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Any, List
+from zoneinfo import ZoneInfo
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
+import asyncpg
+
+from ..config import settings
+
+_db_pool = None
+
+async def get_db_pool() -> asyncpg.Pool:
+    """
+    Returns the shared asyncpg connection pool, initializing it if needed.
+    """
+    global _db_pool
+
+    if _db_pool is None:
+        _db_pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=5)
+
+    return _db_pool
+
+async def get_property_timezone(property_id: str, tenant_id: str) -> ZoneInfo:
+    """
+    Returns the timezone a property books in, defaulting to UTC.
+    """
+    pool = await get_db_pool()
+
+    timezone_name = await pool.fetchval(
+        "SELECT timezone FROM properties WHERE id = $1 AND tenant_id = $2",
+        property_id,
+        tenant_id
+    )
+
+    return ZoneInfo(timezone_name or "UTC")
+
+async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int, db_session=None) -> Decimal:
     """
     Calculates revenue for a specific month.
     """
 
-    start_date = datetime(year, month, 1)
+    property_timezone = await get_property_timezone(property_id, tenant_id)
+
+    start_date = datetime(year, month, 1, tzinfo=property_timezone)
     if month < 12:
-        end_date = datetime(year, month + 1, 1)
+        end_date = datetime(year, month + 1, 1, tzinfo=property_timezone)
     else:
-        end_date = datetime(year + 1, 1, 1)
-        
+        end_date = datetime(year + 1, 1, 1, tzinfo=property_timezone)
+
+    # check_in_date is a timestamptz, so compare in UTC.
+    start_date = start_date.astimezone(timezone.utc)
+    end_date = end_date.astimezone(timezone.utc)
+
     print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
 
-    # SQL Simulation (This would be executed against the actual DB)
     query = """
         SELECT SUM(total_amount) as total
         FROM reservations
@@ -24,67 +61,53 @@ async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_
         AND check_in_date >= $3
         AND check_in_date < $4
     """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+
+    # Use the caller supplied session when there is one, otherwise the shared pool.
+    connection = db_session if db_session is not None else await get_db_pool()
+
+    result = await connection.fetchval(query, property_id, tenant_id, start_date, end_date)
+
+    # SUM() returns NULL when the month has no reservations.
+    return result if result is not None else Decimal('0')
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
     Aggregates revenue from database.
     """
     try:
-        # Import database pool
-        from app.core.database_pool import DatabasePool
-        
-        # Initialize pool if needed
-        db_pool = DatabasePool()
-        await db_pool.initialize()
-        
-        if db_pool.session_factory:
-            async with db_pool.get_session() as session:
-                # Use SQLAlchemy text for raw SQL
-                from sqlalchemy import text
-                
-                query = text("""
-                    SELECT 
-                        property_id,
-                        SUM(total_amount) as total_revenue,
-                        COUNT(*) as reservation_count
-                    FROM reservations 
-                    WHERE property_id = :property_id AND tenant_id = :tenant_id
-                    GROUP BY property_id
-                """)
-                
-                result = await session.execute(query, {
-                    "property_id": property_id, 
-                    "tenant_id": tenant_id
-                })
-                row = result.fetchone()
-                
-                if row:
-                    total_revenue = Decimal(str(row.total_revenue))
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": str(total_revenue),
-                        "currency": "USD", 
-                        "count": row.reservation_count
-                    }
-                else:
-                    # No reservations found for this property
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": "0.00",
-                        "currency": "USD",
-                        "count": 0
-                    }
+        pool = await get_db_pool()
+
+        query = """
+            SELECT 
+                property_id,
+                SUM(total_amount) as total_revenue,
+                COUNT(*) as reservation_count
+            FROM reservations 
+            WHERE property_id = $1 AND tenant_id = $2
+            GROUP BY property_id
+        """
+
+        row = await pool.fetchrow(query, property_id, tenant_id)
+
+        if row:
+            total_revenue = Decimal(str(row["total_revenue"]))
+            return {
+                "property_id": property_id,
+                "tenant_id": tenant_id,
+                "total": str(total_revenue),
+                "currency": "USD", 
+                "count": row["reservation_count"]
+            }
         else:
-            raise Exception("Database pool not available")
-            
+            # No reservations found for this property
+            return {
+                "property_id": property_id,
+                "tenant_id": tenant_id,
+                "total": "0.00",
+                "currency": "USD",
+                "count": 0
+            }
+
     except Exception as e:
         print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
         
